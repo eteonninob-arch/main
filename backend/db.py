@@ -1017,6 +1017,28 @@ def set_legal_hold(proof_id: str, hold: bool) -> None:
         connection.commit()
 
 
+def count_expired_events() -> int:
+    """Return how many proof events ``purge_expired_events`` would delete.
+
+    Read-only; uses the same filter as the purge so retention dry runs match.
+    """
+    if not database_url():
+        return 0
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select count(*) as expired
+                from proof_events
+                where expires_at is not null
+                  and expires_at <= now()
+                  and legal_hold = false;
+                """
+            )
+            row = cursor.fetchone()
+    return int(row["expired"]) if row else 0
+
+
 def purge_expired_events(batch_size: int = RETENTION_BATCH_DEFAULT_SIZE) -> list[dict[str, Any]]:
     """Delete proof events past their expiration that are not on legal hold.
 
