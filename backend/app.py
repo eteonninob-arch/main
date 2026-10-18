@@ -1013,7 +1013,28 @@ def create_app() -> Flask:
                 status=400,
             )
 
-        return ok_response({"events": find_proof_events_by_video(video_hash)})
+        limit = request.args.get("limit", "25")
+        cursor_token = request.args.get("cursor")
+        try:
+            parsed_limit = int(limit)
+        except ValueError:
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="limit must be an integer",
+                status=400,
+            )
+
+        cursor_id = None
+        if cursor_token is not None and cursor_token != "":
+            try:
+                cursor_id = decode_proof_events_cursor(cursor_token)
+            except ValueError:
+                return jsonify({"error": "invalid cursor"}), 400
+
+        events, next_cursor = find_proof_events_by_video(
+            video_hash, parsed_limit, cursor_id=cursor_id
+        )
+        return ok_response({"events": events, "nextCursor": next_cursor})
 
     @app.get("/api/lineage/by-actor/<actor_address>")
     def lineage_by_actor(actor_address: str):
@@ -1111,7 +1132,7 @@ def create_app() -> Flask:
             try:
                 events = []
                 if video_hash:
-                    events = find_proof_events_by_video(video_hash)
+                    events, _ = find_proof_events_by_video(video_hash)
                     if proof_id:
                         events = [e for e in events if e.get("proof_id") == proof_id]
                 else:
