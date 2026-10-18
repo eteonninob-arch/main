@@ -574,41 +574,88 @@ def list_proof_events(
     return rows, next_cursor
 
 
-def find_proof_events_by_video(video_hash: str) -> list[dict[str, Any]]:
+def find_proof_events_by_video(
+    video_hash: str,
+    limit: int = PROOF_EVENTS_DEFAULT_LIMIT,
+    *,
+    cursor_id: int | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     if not database_url():
-        return []
+        return [], None
+
+    page_size = clamp_proof_events_limit(limit)
+    fetch_size = page_size + 1
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                select
-                    id,
-                    event_type,
-                    file_name,
-                    video_hash,
-                    metadata_hash,
-                    proof_id,
-                    tier,
-                    embedded_hash,
-                    tx_hash,
-                    tx_status,
-                    source_address,
-                    contract_id,
-                    retention_class,
-                    expires_at,
-                    legal_hold,
-                    metadata,
-                    time_attestation,
-                    claimed_capture_time,
-                    created_at
-                from proof_events
-                where video_hash = %s
-                order by id desc;
-                """,
-                (video_hash,),
-            )
-            return [dict(row) for row in cursor.fetchall()]
+            if cursor_id is None:
+                cursor.execute(
+                    """
+                    select
+                        id,
+                        event_type,
+                        file_name,
+                        video_hash,
+                        metadata_hash,
+                        proof_id,
+                        tier,
+                        embedded_hash,
+                        tx_hash,
+                        tx_status,
+                        source_address,
+                        contract_id,
+                        retention_class,
+                        expires_at,
+                        legal_hold,
+                        metadata,
+                        time_attestation,
+                        claimed_capture_time,
+                        created_at
+                    from proof_events
+                    where video_hash = %s
+                    order by id desc
+                    limit %s;
+                    """,
+                    (video_hash, fetch_size),
+                )
+            else:
+                cursor.execute(
+                    """
+                    select
+                        id,
+                        event_type,
+                        file_name,
+                        video_hash,
+                        metadata_hash,
+                        proof_id,
+                        tier,
+                        embedded_hash,
+                        tx_hash,
+                        tx_status,
+                        source_address,
+                        contract_id,
+                        retention_class,
+                        expires_at,
+                        legal_hold,
+                        metadata,
+                        time_attestation,
+                        claimed_capture_time,
+                        created_at
+                    from proof_events
+                    where video_hash = %s
+                      and id < %s
+                    order by id desc
+                    limit %s;
+                    """,
+                    (video_hash, cursor_id, fetch_size),
+                )
+            rows = [dict(row) for row in cursor.fetchall()]
+
+    next_cursor: str | None = None
+    if len(rows) > page_size:
+        rows = rows[:page_size]
+        next_cursor = encode_proof_events_cursor(int(rows[-1]["id"]))
+    return rows, next_cursor
 
 
 def find_proof_owner(proof_id: str) -> str | None:
