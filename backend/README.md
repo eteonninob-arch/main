@@ -428,6 +428,28 @@ store = CheckpointStore(deployment=deployment)
 checkpoint = store.record(1_250)
 ```
 
+## Resumable Evidence Integrity Verification
+
+`evidence_storage.py` provides bounded, resumable integrity verification across
+stored encrypted evidence blobs (`verify_evidence_batch()` and
+`verify_evidence_resumable()`):
+
+- Blobs are scanned in deterministic `content_hash` order in bounded batches
+  (`DEFAULT_VERIFY_BATCH_SIZE=50`, clamped to `MAX_VERIFY_BATCH_SIZE=500`).
+- Each blob's metadata (`content_hash`, `size_bytes`, `storage_path`) and
+  Fernet ciphertext are verified. Unverifiable legacy blobs (e.g. missing or
+  `legacy:`-prefixed DEK, unreadable legacy master key, non-SHA-256 legacy
+  hash, or missing `size_bytes`) are counted separately under
+  `unverifiable_legacy` rather than conflated with ciphertext/metadata
+  corruption (`failed`).
+- Resumable progress is written atomically to
+  `storage.get_integrity_progress_path()` under `HARPOCRATES_STORAGE_DIR`
+  (default `/tmp/harpocrates_jobs/evidence_integrity_progress.json`).
+- Persisted progress records only nonsecret metadata (`schema_version`,
+  `run_id`, `status`, `cursor`, `batch_size`, `batches_completed`, `totals`,
+  `failure_reasons`, `legacy_reasons`, `updated_at`) — never plaintext,
+  ciphertext, DEKs, master keys, or filesystem paths.
+
 ## Test
 
 ```powershell

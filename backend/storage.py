@@ -60,6 +60,12 @@ def get_job_output_path(job_id: int | str) -> Path:
     return get_storage_dir() / f"job_{job_id}_output"
 
 
+def get_integrity_progress_path(filename: str = "evidence_integrity_progress.json") -> Path:
+    if not filename or Path(filename).name != filename or filename in {".", ".."}:
+        raise ValueError("filename must be a simple file name without path separators")
+    return get_storage_dir() / filename
+
+
 def _parse_timestamp(val: Any) -> datetime:
     if isinstance(val, datetime):
         return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
