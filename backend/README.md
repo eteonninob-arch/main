@@ -224,6 +224,49 @@ changes: it orphans every previously cached entry instead of silently reusing
 results derived under a different scheme. Keys are digests only — proof
 material is never stored in plaintext or logged.
 
+## Resumable Evidence Integrity Verification
+
+`evidence_storage.py` provides bounded, resumable integrity verification across
+stored encrypted evidence blobs (`verify_evidence_batch()` and
+`verify_evidence_resumable()`):
+
+- Blobs are scanned in deterministic `content_hash` order in bounded batches
+  (`DEFAULT_VERIFY_BATCH_SIZE=50`, clamped to `MAX_VERIFY_BATCH_SIZE=500`).
+- Each blob's metadata (`content_hash`, `size_bytes`, `storage_path`) and
+  Fernet ciphertext are verified. Unverifiable legacy blobs (e.g. missing or
+  `legacy:`-prefixed DEK, unreadable legacy master key, non-SHA-256 legacy
+  hash, or missing `size_bytes`) are counted separately under
+  `unverifiable_legacy` rather than conflated with ciphertext/metadata
+  corruption (`failed`).
+- Resumable progress is written atomically to
+  `storage.get_integrity_progress_path()` under `HARPOCRATES_STORAGE_DIR`
+  (default `/tmp/harpocrates_jobs/evidence_integrity_progress.json`).
+- Persisted progress records only nonsecret metadata (`schema_version`,
+  `run_id`, `status`, `cursor`, `batch_size`, `batches_completed`, `totals`,
+  `failure_reasons`, `legacy_reasons`, `updated_at`) — never plaintext,
+  ciphertext, DEKs, master keys, or filesystem paths.
+
+## Encrypted Evidence Export Manifest
+
+`evidence_storage.export_evidence_manifest(authorized_tenants, ...)` produces a
+read-only, canonical JSON manifest of encrypted evidence blobs referenced by the
+authorized tenants:
+
+- **Included fields**: `manifest_version`, `read_only` (`true`), `generated_at`
+  (UTC ISO-8601), `authorized_tenants`, `entry_count`, deterministic `entries`
+  (`blob_digest`, `envelope_version`, `size_bytes`, and `authorized_references`
+  with `tenant_id` and `ref_count`), and a SHA-256 `manifest_digest` over the
+  canonical JSON payload.
+- **Excluded fields**: Unwrapped data encryption keys (DEKs), wrapped DEKs
+  (`encrypted_dek`), local storage paths (`storage_path`), and any sensitive
+  media metadata are never selected from the database or included in the
+  manifest.
+- **Fail-closed guarantees**: Empty or invalid `authorized_tenants`, malformed
+  digests, invalid envelope versions, naive timestamps, and conflicting blob
+  metadata raise `ValueError`. Unreferenced blobs (`ref_count <= 0`) and
+  unauthorized tenant references are excluded, and no database writes or key
+  unwrapping occur.
+
 ## Test
 
 ```powershell
