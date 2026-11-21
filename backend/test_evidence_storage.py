@@ -47,7 +47,11 @@ class FakeCursor:
         normalized = " ".join(sql.lower().split())
 
         if normalized.startswith("insert into blobs"):
-            content_hash, encrypted_dek, size_bytes, storage_path = params
+            if len(params) == 5:
+                content_hash, encrypted_dek, size_bytes, storage_path, envelope_version = params
+            else:
+                content_hash, encrypted_dek, size_bytes, storage_path = params
+                envelope_version = None
             # ON CONFLICT (content_hash) DO NOTHING
             with self.connection.lock:
                 if content_hash not in self.connection.blobs:
@@ -56,6 +60,7 @@ class FakeCursor:
                         "encrypted_dek": encrypted_dek,
                         "size_bytes": size_bytes,
                         "storage_path": storage_path,
+                        "envelope_version": envelope_version,
                         "created_at": time.time(),
                     }
             self._last_row = None
@@ -75,7 +80,7 @@ class FakeCursor:
                     }
             self._last_row = None
 
-        elif normalized.startswith("select encrypted_dek, storage_path from blobs"):
+        elif normalized.startswith("select encrypted_dek, storage_path, envelope_version from blobs"):
             (content_hash,) = params
             with self.connection.lock:
                 blob = self.connection.blobs.get(content_hash)
@@ -85,6 +90,7 @@ class FakeCursor:
                     self._last_row = FakeRow(
                         encrypted_dek=blob["encrypted_dek"],
                         storage_path=blob["storage_path"],
+                        envelope_version=blob.get("envelope_version"),
                     )
 
         elif "select ref_count from tenant_blob_refs" in normalized:
@@ -338,14 +344,15 @@ def test_record_blob_executes_parameterized_insert_and_commits(
     assert len(fake_db.executed) == 1
     sql, params = fake_db.executed[0]
     normalized_sql = " ".join(sql.lower().split())
-    assert "insert into blobs (content_hash, encrypted_dek, size_bytes, storage_path)" in normalized_sql
-    assert "values (%s, %s, %s, %s)" in normalized_sql
+    assert "insert into blobs (content_hash, encrypted_dek, size_bytes, storage_path, envelope_version)" in normalized_sql
+    assert "values (%s, %s, %s, %s, %s)" in normalized_sql
     assert "on conflict (content_hash) do nothing" in normalized_sql
     assert params == (
         content_hash,
         encrypted_dek.decode(),
         size_bytes,
         storage_path,
+        evidence_storage.DEFAULT_ENVELOPE_VERSION,
     )
 
 
@@ -361,14 +368,27 @@ def test_record_blob_idempotent_on_duplicate_content_hash(
 
     assert fake_db.commits == 2
     assert len(fake_db.executed) == 2
-    assert fake_db.executed[0][1] == (content_hash, first_dek.decode(), 1024, "/blobs/first")
-    assert fake_db.executed[1][1] == (content_hash, second_dek.decode(), 9999, "/blobs/second")
+    assert fake_db.executed[0][1] == (
+        content_hash,
+        first_dek.decode(),
+        1024,
+        "/blobs/first",
+        evidence_storage.DEFAULT_ENVELOPE_VERSION,
+    )
+    assert fake_db.executed[1][1] == (
+        content_hash,
+        second_dek.decode(),
+        9999,
+        "/blobs/second",
+        evidence_storage.DEFAULT_ENVELOPE_VERSION,
+    )
 
     # Duplicate content_hash preserves the original blob entry (DO NOTHING)
     info = evidence_storage.get_blob_info(content_hash)
     assert info == {
         "encrypted_dek": first_dek.decode(),
         "storage_path": "/blobs/first",
+        "envelope_version": evidence_storage.DEFAULT_ENVELOPE_VERSION,
     }
 
 
@@ -405,7 +425,7 @@ def test_get_blob_info_returns_none_for_unknown_and_dict_for_known(
 
     assert evidence_storage.get_blob_info(unknown_hash) is None
     sql, params = fake_db.executed[-1]
-    assert "select encrypted_dek, storage_path from blobs where content_hash = %s" in " ".join(
+    assert "select encrypted_dek, storage_path, envelope_version from blobs where content_hash = %s" in " ".join(
         sql.lower().split()
     )
     assert params == (unknown_hash,)
@@ -416,6 +436,7 @@ def test_get_blob_info_returns_none_for_unknown_and_dict_for_known(
     assert result == {
         "encrypted_dek": encrypted_dek.decode(),
         "storage_path": storage_path,
+        "envelope_version": evidence_storage.DEFAULT_ENVELOPE_VERSION,
     }
     assert isinstance(result, dict)
 
@@ -799,6 +820,7 @@ class EvidenceStorageUnittestSuite(unittest.TestCase):
             {
                 "encrypted_dek": encrypted_dek.decode(),
                 "storage_path": "/blobs/ee",
+                "envelope_version": evidence_storage.DEFAULT_ENVELOPE_VERSION,
             },
         )
         unwrapped_dek = evidence_storage.decrypt_dek(
@@ -806,9 +828,101 @@ class EvidenceStorageUnittestSuite(unittest.TestCase):
         )
         self.assertEqual(unwrapped_dek, dek)
         self.assertEqual(
-            evidence_storage.get_encryptor(unwrapped_dek).decrypt(ciphertext),
+            evidence_storage.decrypt_blob_ciphertext(
+                unwrapped_dek,
+                ciphertext,
+                envelope_version=blob_info["envelope_version"],
+            ),
             b"evidence-bytes",
         )
+
+
+# ---------------------------------------------------------------------------
+# Encryption envelope version tests
+# ---------------------------------------------------------------------------
+
+
+def test_classify_envelope_version_distinguishes_supported_legacy_and_unsupported() -> None:
+    assert (
+        evidence_storage.classify_envelope_version(evidence_storage.ENVELOPE_VERSION_FERNET_V1)
+        == evidence_storage.ENVELOPE_CLASS_SUPPORTED
+    )
+    assert (
+        evidence_storage.classify_envelope_version("  fernet-v1  ")
+        == evidence_storage.ENVELOPE_CLASS_SUPPORTED
+    )
+
+    # Known legacy formats (including pre-versioning NULL metadata)
+    assert evidence_storage.classify_envelope_version(None) == evidence_storage.ENVELOPE_CLASS_LEGACY
+    assert evidence_storage.classify_envelope_version("legacy-v0") == evidence_storage.ENVELOPE_CLASS_LEGACY
+    assert evidence_storage.classify_envelope_version("fernet-v0") == evidence_storage.ENVELOPE_CLASS_LEGACY
+
+    # Unsupported formats
+    for bad in ("", "   ", "aes-gcm-v2", "fernet-v99", "unknown", 1, True, b"fernet-v1"):
+        assert (
+            evidence_storage.classify_envelope_version(bad)
+            == evidence_storage.ENVELOPE_CLASS_UNSUPPORTED
+        )
+
+
+def test_record_blob_rejects_legacy_and_unsupported_envelope_versions(
+    fake_db: FakeConnection,
+) -> None:
+    content_hash = "f" * 64
+    encrypted_dek = b"gAAAAABk-fake-dek"
+
+    with pytest.raises(evidence_storage.LegacyEnvelopeVersionError):
+        evidence_storage.record_blob(
+            content_hash, encrypted_dek, 128, "/blobs/legacy", envelope_version="legacy-v0"
+        )
+
+    with pytest.raises(evidence_storage.UnsupportedEnvelopeVersionError):
+        evidence_storage.record_blob(
+            content_hash, encrypted_dek, 128, "/blobs/unknown", envelope_version="aes-gcm-v2"
+        )
+
+    with pytest.raises(evidence_storage.UnsupportedEnvelopeVersionError):
+        evidence_storage.record_blob(
+            content_hash, encrypted_dek, 128, "/blobs/empty", envelope_version="   "
+        )
+
+    assert fake_db.commits == 0
+    assert fake_db.executed == []
+
+
+def test_decrypt_blob_ciphertext_never_guesses_algorithm_from_malformed_ciphertext() -> None:
+    dek = Fernet.generate_key()
+    plaintext = b"synthetic-evidence-envelope-test"
+    valid_ciphertext = evidence_storage.get_encryptor(dek).encrypt(plaintext)
+
+    # Supported explicit version decrypts cleanly
+    assert (
+        evidence_storage.decrypt_blob_ciphertext(
+            dek, valid_ciphertext, envelope_version=evidence_storage.ENVELOPE_VERSION_FERNET_V1
+        )
+        == plaintext
+    )
+
+    # Pre-versioning legacy row (None) remains compatible with Fernet
+    assert (
+        evidence_storage.decrypt_blob_ciphertext(dek, valid_ciphertext, envelope_version=None)
+        == plaintext
+    )
+
+    # Malformed ciphertext fails closed with InvalidToken (never guesses another algorithm)
+    for malformed in (b"", b"not-fernet", b"\x00\x01\x02aes-gcm-like-header", valid_ciphertext[:-4]):
+        with pytest.raises(InvalidToken):
+            evidence_storage.decrypt_blob_ciphertext(
+                dek, malformed, envelope_version=evidence_storage.ENVELOPE_VERSION_FERNET_V1
+            )
+
+    # Known legacy version raises LegacyEnvelopeVersionError without attempting decryption
+    with pytest.raises(evidence_storage.LegacyEnvelopeVersionError):
+        evidence_storage.decrypt_blob_ciphertext(dek, valid_ciphertext, envelope_version="legacy-v0")
+
+    # Unsupported version raises UnsupportedEnvelopeVersionError even if ciphertext is valid Fernet
+    with pytest.raises(evidence_storage.UnsupportedEnvelopeVersionError):
+        evidence_storage.decrypt_blob_ciphertext(dek, valid_ciphertext, envelope_version="aes-gcm-v2")
 
 
 if __name__ == "__main__":

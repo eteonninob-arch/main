@@ -428,6 +428,24 @@ store = CheckpointStore(deployment=deployment)
 checkpoint = store.record(1_250)
 ```
 
+## Encryption Envelope Versions
+
+`evidence_storage.py` records an explicit `envelope_version` column on `blobs`
+(default `fernet-v1`, added in migration 13):
+
+- `classify_envelope_version()` distinguishes supported versions (`fernet-v1`),
+  known legacy envelopes (`None` for pre-versioning rows, `legacy-v0`,
+  `fernet-v0`), and unsupported formats (any unrecognized, empty, or non-string
+  identifier).
+- `record_blob()` validates and stores `envelope_version`, rejecting known
+  legacy or unsupported values on write.
+- `decrypt_blob_ciphertext()` dispatches strictly on the recorded
+  `envelope_version` and never guesses a decryption algorithm from malformed
+  ciphertext. Known legacy versions raise `LegacyEnvelopeVersionError`, while
+  unsupported formats fail closed with `UnsupportedEnvelopeVersionError`.
+  Pre-versioning rows with `envelope_version IS NULL` remain compatible with
+  Fernet.
+
 ## Test
 
 ```powershell

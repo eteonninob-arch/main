@@ -7,7 +7,58 @@ from cryptography.fernet import Fernet
 import db
 from storage import _parse_timestamp
 
+ENVELOPE_VERSION_FERNET_V1 = "fernet-v1"
+DEFAULT_ENVELOPE_VERSION = ENVELOPE_VERSION_FERNET_V1
+SUPPORTED_ENVELOPE_VERSIONS: frozenset[str] = frozenset({ENVELOPE_VERSION_FERNET_V1})
+KNOWN_LEGACY_ENVELOPE_VERSIONS: frozenset[str] = frozenset({"legacy-v0", "fernet-v0"})
+
+ENVELOPE_CLASS_SUPPORTED = "supported"
+ENVELOPE_CLASS_LEGACY = "legacy"
+ENVELOPE_CLASS_UNSUPPORTED = "unsupported"
+
 logger = logging.getLogger("harpocrates.evidence_storage")
+
+
+class UnsupportedEnvelopeVersionError(ValueError):
+    """Raised when an encryption envelope version is unknown or unsupported."""
+
+
+class LegacyEnvelopeVersionError(ValueError):
+    """Raised when a known legacy envelope version cannot be decrypted directly."""
+
+
+def classify_envelope_version(envelope_version: object) -> str:
+    """Classify an encryption envelope version as supported, known legacy, or unsupported.
+
+    A ``None`` value represents a pre-versioning legacy metadata row and is
+    classified as ``legacy``. Explicit legacy identifiers in
+    ``KNOWN_LEGACY_ENVELOPE_VERSIONS`` are also classified as ``legacy``.
+    Any other unrecognized, empty, or non-string value is ``unsupported``.
+    """
+    if envelope_version is None:
+        return ENVELOPE_CLASS_LEGACY
+    if not isinstance(envelope_version, str):
+        return ENVELOPE_CLASS_UNSUPPORTED
+    normalized = envelope_version.strip()
+    if normalized in SUPPORTED_ENVELOPE_VERSIONS:
+        return ENVELOPE_CLASS_SUPPORTED
+    if normalized in KNOWN_LEGACY_ENVELOPE_VERSIONS:
+        return ENVELOPE_CLASS_LEGACY
+    return ENVELOPE_CLASS_UNSUPPORTED
+
+
+def validate_envelope_version(envelope_version: object) -> str:
+    """Validate and return a supported envelope version for new evidence blobs."""
+    if not isinstance(envelope_version, str):
+        raise UnsupportedEnvelopeVersionError("envelope_version must be a supported string identifier")
+    normalized = envelope_version.strip()
+    if normalized in SUPPORTED_ENVELOPE_VERSIONS:
+        return normalized
+    if normalized in KNOWN_LEGACY_ENVELOPE_VERSIONS:
+        raise LegacyEnvelopeVersionError(
+            f"legacy envelope_version {normalized!r} cannot be used for new evidence blobs"
+        )
+    raise UnsupportedEnvelopeVersionError(f"unsupported envelope_version: {envelope_version!r}")
 
 
 def generate_dek() -> Tuple[bytes, bytes]:
@@ -31,20 +82,61 @@ def decrypt_dek(encrypted_dek: bytes) -> bytes:
     return f.decrypt(encrypted_dek)
 
 
-def get_encryptor(dek: bytes):
-    return Fernet(dek)
+def get_encryptor(dek: bytes, envelope_version: str = DEFAULT_ENVELOPE_VERSION):
+    validated = validate_envelope_version(envelope_version)
+    if validated == ENVELOPE_VERSION_FERNET_V1:
+        return Fernet(dek)
+    raise UnsupportedEnvelopeVersionError(f"unsupported envelope_version: {envelope_version!r}")
 
 
-def record_blob(content_hash: str, encrypted_dek: bytes, size_bytes: int, storage_path: str):
+def decrypt_blob_ciphertext(
+    dek: bytes,
+    ciphertext: bytes,
+    *,
+    envelope_version: object = DEFAULT_ENVELOPE_VERSION,
+) -> bytes:
+    """Decrypt blob ciphertext using only the algorithm declared by ``envelope_version``.
+
+    Never inspects or guesses a decryption algorithm from malformed ciphertext.
+    A ``None`` ``envelope_version`` represents a pre-versioning legacy Fernet
+    row and is decrypted strictly with Fernet (no fallback). Explicit known
+    legacy versions raise ``LegacyEnvelopeVersionError``; unknown or malformed
+    version identifiers raise ``UnsupportedEnvelopeVersionError``.
+    """
+    if envelope_version is None:
+        return Fernet(dek).decrypt(ciphertext)
+
+    classification = classify_envelope_version(envelope_version)
+    if classification == ENVELOPE_CLASS_SUPPORTED:
+        normalized = envelope_version.strip()  # type: ignore[union-attr]
+        if normalized == ENVELOPE_VERSION_FERNET_V1:
+            return Fernet(dek).decrypt(ciphertext)
+    if classification == ENVELOPE_CLASS_LEGACY:
+        raise LegacyEnvelopeVersionError(
+            f"known legacy envelope_version cannot be decrypted directly: {envelope_version!r}"
+        )
+    raise UnsupportedEnvelopeVersionError(
+        f"unsupported envelope_version: {envelope_version!r}"
+    )
+
+
+def record_blob(
+    content_hash: str,
+    encrypted_dek: bytes,
+    size_bytes: int,
+    storage_path: str,
+    envelope_version: str = DEFAULT_ENVELOPE_VERSION,
+):
+    validated_version = validate_envelope_version(envelope_version)
     with db.get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                insert into blobs (content_hash, encrypted_dek, size_bytes, storage_path)
-                values (%s, %s, %s, %s)
+                insert into blobs (content_hash, encrypted_dek, size_bytes, storage_path, envelope_version)
+                values (%s, %s, %s, %s, %s)
                 on conflict (content_hash) do nothing
                 """,
-                (content_hash, encrypted_dek.decode(), size_bytes, storage_path)
+                (content_hash, encrypted_dek.decode(), size_bytes, storage_path, validated_version),
             )
         conn.commit()
 
@@ -174,7 +266,10 @@ def collect_unreferenced_blobs(limit: int = 100) -> int:
 def get_blob_info(content_hash: str) -> dict | None:
     with db.get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("select encrypted_dek, storage_path from blobs where content_hash = %s", (content_hash,))
+            cursor.execute(
+                "select encrypted_dek, storage_path, envelope_version from blobs where content_hash = %s",
+                (content_hash,),
+            )
             row = cursor.fetchone()
             return dict(row) if row else None
 def preview_tenant_retention(
