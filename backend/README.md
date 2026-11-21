@@ -450,6 +450,24 @@ stored encrypted evidence blobs (`verify_evidence_batch()` and
   `failure_reasons`, `legacy_reasons`, `updated_at`) — never plaintext,
   ciphertext, DEKs, master keys, or filesystem paths.
 
+## Encryption Envelope Versions
+
+`evidence_storage.py` records an explicit `envelope_version` column on `blobs`
+(default `fernet-v1`, added in migration 13):
+
+- `classify_envelope_version()` distinguishes supported versions (`fernet-v1`),
+  known legacy envelopes (`None` for pre-versioning rows, `legacy-v0`,
+  `fernet-v0`), and unsupported formats (any unrecognized, empty, or non-string
+  identifier).
+- `record_blob()` validates and stores `envelope_version`, rejecting known
+  legacy or unsupported values on write.
+- `decrypt_blob_ciphertext()` and `verify_blob_integrity()` dispatch strictly
+  on the recorded `envelope_version` and never guess a decryption algorithm
+  from malformed ciphertext. Known legacy versions are reported as
+  `unverifiable_legacy` (`legacy_envelope_version`), while unsupported formats
+  fail closed (`unsupported_envelope_version`). Pre-versioning rows with
+  `envelope_version IS NULL` remain compatible with Fernet.
+
 ## Test
 
 ```powershell
