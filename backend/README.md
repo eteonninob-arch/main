@@ -428,6 +428,27 @@ store = CheckpointStore(deployment=deployment)
 checkpoint = store.record(1_250)
 ```
 
+## Encrypted Evidence Export Manifest
+
+`evidence_storage.export_evidence_manifest(authorized_tenants, ...)` produces a
+read-only, canonical JSON manifest of encrypted evidence blobs referenced by the
+authorized tenants:
+
+- **Included fields**: `manifest_version`, `read_only` (`true`), `generated_at`
+  (UTC ISO-8601), `authorized_tenants`, `entry_count`, deterministic `entries`
+  (`blob_digest`, `envelope_version`, `size_bytes`, and `authorized_references`
+  with `tenant_id` and `ref_count`), and a SHA-256 `manifest_digest` over the
+  canonical JSON payload.
+- **Excluded fields**: Unwrapped data encryption keys (DEKs), wrapped DEKs
+  (`encrypted_dek`), local storage paths (`storage_path`), and any sensitive
+  media metadata are never selected from the database or included in the
+  manifest.
+- **Fail-closed guarantees**: Empty or invalid `authorized_tenants`, malformed
+  digests, invalid envelope versions, naive timestamps, and conflicting blob
+  metadata raise `ValueError`. Unreferenced blobs (`ref_count <= 0`) and
+  unauthorized tenant references are excluded, and no database writes or key
+  unwrapping occur.
+
 ## Test
 
 ```powershell

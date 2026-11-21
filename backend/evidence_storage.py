@@ -1,13 +1,20 @@
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
+import json
 import logging
 import os
 import hashlib
+import re
 from typing import Any, Tuple
 from cryptography.fernet import Fernet
 import db
 from storage import _parse_timestamp
 
 logger = logging.getLogger("harpocrates.evidence_storage")
+
+EXPORT_MANIFEST_VERSION = 1
+DEFAULT_ENVELOPE_VERSION = "fernet-v1"
+_HEX_32_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 
 
 def generate_dek() -> Tuple[bytes, bytes]:
@@ -340,3 +347,166 @@ rewrap_dek = rotate_encryption_key
 rewrap_data_keys = rotate_encryption_key
 stage_key_rotation = rotate_encryption_key
 rotate_master_key = rotate_encryption_key
+
+
+def _normalize_authorized_tenants(authorized_tenants: Iterable[str]) -> list[str]:
+    if isinstance(authorized_tenants, (str, bytes)):
+        raise ValueError("authorized_tenants must be an iterable of tenant identifiers, not a string")
+    normalized: set[str] = set()
+    for tenant in authorized_tenants:
+        if not isinstance(tenant, str) or not tenant.strip():
+            raise ValueError("authorized tenant identifier must be a non-empty string")
+        normalized.add(tenant.strip())
+    if not normalized:
+        raise ValueError("authorized_tenants must contain at least one tenant identifier")
+    return sorted(normalized)
+
+
+def _normalize_digest(value: object) -> str:
+    if not isinstance(value, str) or _HEX_32_PATTERN.fullmatch(value) is None:
+        raise ValueError("blob digest must be a 32-byte hex string")
+    return value.lower()
+
+
+def _normalize_envelope_version(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("envelope_version must be a non-empty string")
+    return value.strip()
+
+
+def _normalize_non_negative_int(value: object, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _normalize_generated_at(generated_at: datetime | None) -> str:
+    if generated_at is None:
+        dt = datetime.now(timezone.utc)
+    else:
+        if not isinstance(generated_at, datetime) or generated_at.tzinfo is None:
+            raise ValueError("generated_at must be a timezone-aware datetime")
+        dt = generated_at.astimezone(timezone.utc)
+    return dt.isoformat()
+
+
+def serialize_evidence_export_manifest(manifest: Mapping[str, Any]) -> str:
+    """Serialize an export manifest to canonical JSON."""
+    return json.dumps(manifest, separators=(",", ":"), sort_keys=True)
+
+
+def build_evidence_export_manifest(
+    rows: Iterable[Mapping[str, Any]],
+    authorized_tenants: Iterable[str],
+    *,
+    envelope_version: str = DEFAULT_ENVELOPE_VERSION,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Build a read-only encrypted evidence export manifest from storage rows.
+
+    Only allowlisted fields (blob digest, envelope version, size_bytes, and
+    authorized tenant references with positive ref_count) are included.
+    Unwrapped data keys, wrapped DEKs, local storage paths, and sensitive media
+    metadata are strictly excluded.
+    """
+    tenants = _normalize_authorized_tenants(authorized_tenants)
+    allowed_set = set(tenants)
+    default_env_version = _normalize_envelope_version(envelope_version)
+    timestamp = _normalize_generated_at(generated_at)
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        tenant_id = row.get("tenant_id")
+        if not isinstance(tenant_id, str) or tenant_id.strip() not in allowed_set:
+            continue
+        tenant_id = tenant_id.strip()
+
+        ref_count = _normalize_non_negative_int(row.get("ref_count", 0), "ref_count")
+        if ref_count <= 0:
+            continue
+
+        digest = _normalize_digest(row.get("content_hash"))
+        size_bytes = _normalize_non_negative_int(row.get("size_bytes"), "size_bytes")
+        row_env_version = _normalize_envelope_version(
+            row.get("envelope_version") or default_env_version
+        )
+
+        entry = grouped.get(digest)
+        if entry is None:
+            grouped[digest] = {
+                "blob_digest": digest,
+                "envelope_version": row_env_version,
+                "size_bytes": size_bytes,
+                "_refs": {tenant_id: ref_count},
+            }
+        else:
+            if entry["size_bytes"] != size_bytes:
+                raise ValueError(f"conflicting size_bytes for blob {digest}")
+            if entry["envelope_version"] != row_env_version:
+                raise ValueError(f"conflicting envelope_version for blob {digest}")
+            entry["_refs"][tenant_id] = entry["_refs"].get(tenant_id, 0) + ref_count
+
+    entries: list[dict[str, Any]] = []
+    for digest in sorted(grouped.keys()):
+        raw_entry = grouped[digest]
+        refs = [
+            {"tenant_id": tid, "ref_count": raw_entry["_refs"][tid]}
+            for tid in sorted(raw_entry["_refs"].keys())
+        ]
+        entries.append(
+            {
+                "blob_digest": raw_entry["blob_digest"],
+                "envelope_version": raw_entry["envelope_version"],
+                "size_bytes": raw_entry["size_bytes"],
+                "authorized_references": refs,
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "manifest_version": EXPORT_MANIFEST_VERSION,
+        "read_only": True,
+        "generated_at": timestamp,
+        "authorized_tenants": tenants,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+    canonical = serialize_evidence_export_manifest(payload).encode("utf-8")
+    payload["manifest_digest"] = hashlib.sha256(canonical).hexdigest()
+    return payload
+
+
+def export_evidence_manifest(
+    authorized_tenants: Iterable[str],
+    *,
+    envelope_version: str = DEFAULT_ENVELOPE_VERSION,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Query encrypted evidence metadata in read-only mode and build an export manifest.
+
+    Never unwraps DEKs, never selects encrypted_dek or storage_path, and never
+    mutates database state.
+    """
+    tenants = _normalize_authorized_tenants(authorized_tenants)
+    default_env_version = _normalize_envelope_version(envelope_version)
+    _normalize_generated_at(generated_at)
+
+    with db.get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                select b.content_hash, b.size_bytes, r.tenant_id, r.ref_count
+                from blobs b
+                inner join tenant_blob_refs r on r.content_hash = b.content_hash
+                where r.tenant_id = any(%s) and r.ref_count > 0
+                order by b.content_hash asc, r.tenant_id asc
+                """,
+                (tenants,),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+
+    return build_evidence_export_manifest(
+        rows,
+        tenants,
+        envelope_version=default_env_version,
+        generated_at=generated_at,
+    )
