@@ -195,9 +195,6 @@ def encode_time_attestation(attestation: TimeAttestation) -> dict[str, Any]:
     if time_bounds:
         obj["timeBounds"] = time_bounds
     
-    for key, value in attestation.extensions.items():
-        obj[key] = value
-    
     return obj
 
 
