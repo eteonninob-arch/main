@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, BinaryIO, Dict, Iterable, Mapping, Optional, Tuple, Union
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -896,3 +896,319 @@ class ResumableUploadSessionStore:
         except SessionNotFoundError:
             return
         shutil.rmtree(session_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Offline upload integrity reporting for failed sessions
+# ---------------------------------------------------------------------------
+
+INTEGRITY_REPORT_SCHEMA_VERSION = 1
+
+DIGEST_STATUS_MATCHED = "matched"
+DIGEST_STATUS_MISMATCH = "mismatch"
+DIGEST_STATUS_UNVERIFIED = "unverified"
+DIGEST_STATUS_UNAVAILABLE = "unavailable"
+
+BYTE_COUNT_STATUS_MATCHED = "matched"
+BYTE_COUNT_STATUS_UNDERFLOW = "underflow"
+BYTE_COUNT_STATUS_OVERFLOW = "overflow"
+BYTE_COUNT_STATUS_UNKNOWN = "unknown"
+
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_CHUNK_FILE_RE = re.compile(r"^chunk-(\d+)$")
+
+
+def _normalize_digest(digest: Optional[str]) -> Optional[str]:
+    if digest is None:
+        return None
+    normalized = digest.strip().lower()
+    return normalized or None
+
+
+def _sanitize_session_id(session_id: Optional[str]) -> Optional[str]:
+    """Return *session_id* only if it is an opaque identifier, never a path."""
+    if session_id is None:
+        return None
+    candidate = session_id.strip()
+    if not candidate or ".." in candidate or not _SAFE_SESSION_ID_RE.match(candidate):
+        return None
+    return candidate
+
+
+def _classify_digest_status(
+    expected_digest: Optional[str],
+    observed_digest: Optional[str],
+) -> str:
+    if observed_digest is None:
+        return DIGEST_STATUS_UNAVAILABLE
+    if expected_digest is None:
+        return DIGEST_STATUS_UNVERIFIED
+    if observed_digest == expected_digest:
+        return DIGEST_STATUS_MATCHED
+    return DIGEST_STATUS_MISMATCH
+
+
+def _classify_byte_count_status(
+    expected_bytes: Optional[int],
+    observed_bytes: int,
+) -> str:
+    if expected_bytes is None:
+        return BYTE_COUNT_STATUS_UNKNOWN
+    if observed_bytes == expected_bytes:
+        return BYTE_COUNT_STATUS_MATCHED
+    if observed_bytes < expected_bytes:
+        return BYTE_COUNT_STATUS_UNDERFLOW
+    return BYTE_COUNT_STATUS_OVERFLOW
+
+
+@dataclass(frozen=True)
+class ChunkIntegritySummary:
+    """Privacy-safe integrity summary for a single indexed upload chunk.
+
+    Contains only numeric indices, byte counts, and SHA-256 digest metadata —
+    never uploaded media bytes or private filenames.
+    """
+
+    chunk_index: int
+    observed_bytes: int
+    observed_digest: Optional[str]
+    expected_bytes: Optional[int] = None
+    expected_digest: Optional[str] = None
+    byte_count_status: str = BYTE_COUNT_STATUS_UNKNOWN
+    digest_status: str = DIGEST_STATUS_UNVERIFIED
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "chunk_index": self.chunk_index,
+            "expected_bytes": self.expected_bytes,
+            "observed_bytes": self.observed_bytes,
+            "byte_count_status": self.byte_count_status,
+            "expected_digest": self.expected_digest,
+            "observed_digest": self.observed_digest,
+            "digest_status": self.digest_status,
+        }
+
+
+@dataclass(frozen=True)
+class UploadIntegrityReport:
+    """Offline integrity report for a failed (or inspected) upload session.
+
+    Excludes uploaded media bytes, filesystem paths, and private filenames.
+    """
+
+    schema_version: int
+    session_id: Optional[str]
+    status: str
+    failure_reason: Optional[str]
+    expected_bytes: Optional[int]
+    observed_bytes: int
+    byte_count_status: str
+    expected_digest: Optional[str]
+    observed_digest: Optional[str]
+    digest_status: str
+    chunk_count: int
+    missing_chunk_indices: Tuple[int, ...]
+    chunks: Tuple[ChunkIntegritySummary, ...]
+    generated_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "session_id": self.session_id,
+            "status": self.status,
+            "failure_reason": self.failure_reason,
+            "expected_bytes": self.expected_bytes,
+            "observed_bytes": self.observed_bytes,
+            "byte_count_status": self.byte_count_status,
+            "expected_digest": self.expected_digest,
+            "observed_digest": self.observed_digest,
+            "digest_status": self.digest_status,
+            "chunk_count": self.chunk_count,
+            "missing_chunk_indices": list(self.missing_chunk_indices),
+            "chunks": [chunk.to_dict() for chunk in self.chunks],
+            "generated_at": self.generated_at,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, indent=2)
+
+
+def build_upload_integrity_report(
+    *,
+    session_id: Optional[str] = None,
+    expected_bytes: Optional[int] = None,
+    observed_bytes: int = 0,
+    expected_digest: Optional[str] = None,
+    observed_digest: Optional[str] = None,
+    failure_reason: Optional[str] = None,
+    chunks: Iterable[ChunkIntegritySummary] = (),
+    missing_chunk_indices: Iterable[int] = (),
+    max_bytes: Optional[int] = None,
+) -> UploadIntegrityReport:
+    """Construct a privacy-safe ``UploadIntegrityReport`` from session metrics."""
+    norm_expected_digest = _normalize_digest(expected_digest)
+    norm_observed_digest = _normalize_digest(observed_digest)
+    byte_status = _classify_byte_count_status(expected_bytes, observed_bytes)
+    digest_status = _classify_digest_status(norm_expected_digest, norm_observed_digest)
+
+    chunk_tuple = tuple(chunks)
+    missing_tuple = tuple(sorted(set(missing_chunk_indices)))
+
+    inferred_reason = failure_reason
+    if inferred_reason is None:
+        if max_bytes is not None and max_bytes > 0 and observed_bytes > max_bytes:
+            inferred_reason = "size_limit_exceeded"
+        elif missing_tuple:
+            inferred_reason = "chunk_gap"
+        elif byte_status in (BYTE_COUNT_STATUS_UNDERFLOW, BYTE_COUNT_STATUS_OVERFLOW):
+            inferred_reason = "byte_count_mismatch"
+        elif digest_status == DIGEST_STATUS_MISMATCH:
+            inferred_reason = "digest_mismatch"
+
+    status = "failed" if inferred_reason is not None else "verified"
+
+    return UploadIntegrityReport(
+        schema_version=INTEGRITY_REPORT_SCHEMA_VERSION,
+        session_id=_sanitize_session_id(session_id),
+        status=status,
+        failure_reason=inferred_reason,
+        expected_bytes=expected_bytes,
+        observed_bytes=observed_bytes,
+        byte_count_status=byte_status,
+        expected_digest=norm_expected_digest,
+        observed_digest=norm_observed_digest,
+        digest_status=digest_status,
+        chunk_count=len(chunk_tuple),
+        missing_chunk_indices=missing_tuple,
+        chunks=chunk_tuple,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def inspect_failed_upload_session(
+    session_dir: Union[str, Path],
+    *,
+    session_id: Optional[str] = None,
+    expected_bytes: Optional[int] = None,
+    expected_digest: Optional[str] = None,
+    expected_chunks: Optional[int] = None,
+    chunk_expectations: Optional[
+        Mapping[int, Tuple[Optional[int], Optional[str]]]
+    ] = None,
+    failure_reason: Optional[str] = None,
+    chunk_size: int | None = None,
+    max_size: int | None = None,
+) -> UploadIntegrityReport:
+    """Inspect a session directory offline and produce an ``UploadIntegrityReport``.
+
+    Reads only ``chunk-<N>`` files in bounded chunks while computing SHA-256
+    digests. Any other files in *session_dir* are ignored and their names are
+    never recorded. Uploaded media bytes and filesystem paths are excluded from
+    the returned report.
+    """
+    directory = Path(session_dir)
+    if not directory.exists() or not directory.is_dir():
+        return build_upload_integrity_report(
+            session_id=session_id,
+            expected_bytes=expected_bytes,
+            observed_bytes=0,
+            expected_digest=expected_digest,
+            observed_digest=None,
+            failure_reason=failure_reason or "missing_session",
+            max_bytes=max_size,
+        )
+
+    indexed_files: list[Tuple[int, Path]] = []
+    for entry in directory.iterdir():
+        if not entry.is_file():
+            continue
+        match = _CHUNK_FILE_RE.match(entry.name)
+        if match is not None:
+            indexed_files.append((int(match.group(1)), entry))
+
+    indexed_files.sort(key=lambda item: item[0])
+
+    if not indexed_files:
+        missing_indices: list[int] = (
+            list(range(expected_chunks)) if expected_chunks and expected_chunks > 0 else []
+        )
+        return build_upload_integrity_report(
+            session_id=session_id,
+            expected_bytes=expected_bytes,
+            observed_bytes=0,
+            expected_digest=expected_digest,
+            observed_digest=None,
+            failure_reason=failure_reason or "empty_session",
+            missing_chunk_indices=missing_indices,
+            max_bytes=max_size,
+        )
+
+    bounded = resolve_chunk_bytes(chunk_size)
+    combined_hasher = hashlib.sha256()
+    total_observed_bytes = 0
+    chunk_summaries: list[ChunkIntegritySummary] = []
+
+    present_indices = {idx for idx, _ in indexed_files}
+    upper_bound = max(present_indices) + 1
+    if expected_chunks is not None and expected_chunks > upper_bound:
+        upper_bound = expected_chunks
+    missing_indices = [i for i in range(upper_bound) if i not in present_indices]
+
+    for idx, chunk_path in indexed_files:
+        chunk_hasher = hashlib.sha256()
+        chunk_bytes = 0
+        with chunk_path.open("rb") as handle:
+            while True:
+                data = handle.read(bounded)
+                if not data:
+                    break
+                chunk_hasher.update(data)
+                combined_hasher.update(data)
+                chunk_bytes += len(data)
+
+        total_observed_bytes += chunk_bytes
+        c_expected_bytes: Optional[int] = None
+        c_expected_digest: Optional[str] = None
+        if chunk_expectations and idx in chunk_expectations:
+            c_expected_bytes, c_expected_digest = chunk_expectations[idx]
+        c_norm_expected = _normalize_digest(c_expected_digest)
+        c_observed_digest = chunk_hasher.hexdigest()
+
+        chunk_summaries.append(
+            ChunkIntegritySummary(
+                chunk_index=idx,
+                observed_bytes=chunk_bytes,
+                observed_digest=c_observed_digest,
+                expected_bytes=c_expected_bytes,
+                expected_digest=c_norm_expected,
+                byte_count_status=_classify_byte_count_status(
+                    c_expected_bytes, chunk_bytes
+                ),
+                digest_status=_classify_digest_status(
+                    c_norm_expected, c_observed_digest
+                ),
+            )
+        )
+
+    return build_upload_integrity_report(
+        session_id=session_id,
+        expected_bytes=expected_bytes,
+        observed_bytes=total_observed_bytes,
+        expected_digest=expected_digest,
+        observed_digest=combined_hasher.hexdigest(),
+        failure_reason=failure_reason,
+        chunks=chunk_summaries,
+        missing_chunk_indices=missing_indices,
+        max_bytes=max_size,
+    )
+
+
+def write_upload_integrity_report(
+    report: UploadIntegrityReport,
+    destination: Union[str, Path],
+) -> Path:
+    """Persist an ``UploadIntegrityReport`` as canonical JSON to *destination*."""
+    dest = Path(destination)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(report.to_json() + "\n", encoding="utf-8")
+    return dest
