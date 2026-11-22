@@ -105,6 +105,8 @@ This section documents all environment variables that can be used to configure t
 | VERIFIER_CACHE_MAX_SIZE | integer | 10000 | must be positive | Maximum number of entries in the verifier proof cache | no | no |
 | VERIFIER_CACHE_NEGATIVE_TTL_SECONDS | float | 300.0 | must be positive | Time-to-live for negative verifier cache entries (seconds) | no | no |
 | VERIFIER_CACHE_POSITIVE_TTL_SECONDS | float | 86400.0 | must be positive | Time-to-live for positive verifier cache entries (seconds) | no | no |
+| WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT | integer | 2 | must be positive | Maximum concurrent expensive video jobs (`embed`, `extract`) leased per tenant | no | no |
+| WORKER_MAX_QUEUED_VIDEO_JOBS_PER_TENANT | integer | 10 | must be positive | Maximum queued (pending) expensive video jobs (`embed`, `extract`) per tenant | no | no |
 
 ## Chain Indexer Backpressure
 
@@ -156,6 +158,27 @@ stale heartbeats via `get_job_heartbeat_state` and `reclaim_stale_jobs`.
 - Stale heartbeats are reported independently of proof validity: unverified or
   incomplete worker output is never classified as a cryptographic failure, and
   private job payloads are never included in reclaimed-job summaries or logs.
+
+## Per-Tenant Fair Scheduling for Expensive Video Jobs
+
+Expensive video jobs (`embed`, `extract`) are bounded and fairly scheduled per
+tenant in `backend/db.py` and `backend/worker.py`:
+
+- **Per-tenant queue bound**: `enqueue_job` enforces
+  `WORKER_MAX_QUEUED_VIDEO_JOBS_PER_TENANT` (default: `10`, must be positive)
+  for pending `embed`/`extract` jobs per `tenant_id`, raising
+  `TenantQueueLimitExceededError` when exceeded without affecting other tenants
+  or non-video jobs (`verify_tx`, `silent_witness`).
+- **Per-tenant concurrency bound & fair leasing**: `lease_job` enforces
+  `WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT` (default: `2`, must be
+  positive) for running `embed`/`extract` jobs per tenant and schedules
+  eligible tenants fairly (fewest running video jobs first, then
+  least-recently-leased tenant, then FIFO within a tenant).
+- **Independent deadlines & admission controls**: Each job preserves its own
+  optional `deadline_at` / `deadline_seconds` independently of other tenants'
+  delays and existing HTTP `AdmissionController` limits. Expired pending jobs
+  are failed on lease without consuming a tenant concurrency slot, and running
+  jobs that exceed their independent deadline are failed by the worker loop.
 
 ## Noir Developer Worker
 
@@ -275,6 +298,7 @@ behaviour. Temporary state directories are deleted automatically.
 
 - Metric labels strictly record generic HTTP attributes: HTTP `method`, parameterized route rule `endpoint` (e.g., `/api/proofs/by-video/<video_hash>`), and HTTP `status`.
 - Filenames, video hashes, metadata hashes, wallet addresses, proof payload data, and secret seeds are strictly excluded.
+- Analytics telemetry dimensions are strictly validated against an allowed vocabulary (`ALLOWED_DIMENSION_VOCABULARY`) prior to aggregation; raw filenames and cryptographic hashes are rejected from becoming metric labels.
 - Upload sizes are recorded in bounded histogram buckets.
 
 ### Endpoint Protection

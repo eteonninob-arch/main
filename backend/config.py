@@ -88,11 +88,13 @@ class AppConfig:
     retention_blob_gc_enabled: bool = False
     retention_unreferenced_blobs_enabled: bool = False
     retention_dry_run: bool = False
-    # Index rebuild dry-run: build a temporary projection and report diffs only.
-    index_rebuild_dry_run_enabled: bool = False
-    index_rebuild_dry_run_max_events: int = 100_000
-    registration_reconcile_state_dir: str = ""
-    stellar_network_passphrase: str = ""
+    # None falls back to MAX_VIDEO_BYTES; zero allows no file payload.
+    upload_max_bytes: int | None = None
+    # Per-tenant temporary upload storage budget in bytes (None = unlimited).
+    # This limits the total temporary disk space a single tenant can reserve
+    # for in-flight uploads.
+    upload_temp_budget_bytes: int | None = None
+
 
 
 def load_config() -> AppConfig:
@@ -172,14 +174,8 @@ def load_config() -> AppConfig:
         retention_blob_gc_enabled=_blob_gc_enabled_env(),
         retention_unreferenced_blobs_enabled=_blob_gc_enabled_env(),
         retention_dry_run=_bool_env("HARPOCRATES_RETENTION_DRY_RUN", False),
-        index_rebuild_dry_run_enabled=_bool_env("INDEX_REBUILD_DRY_RUN_ENABLED", False),
-        index_rebuild_dry_run_max_events=_int_env("INDEX_REBUILD_DRY_RUN_MAX_EVENTS", 100_000),
-        registration_reconcile_state_dir=_str_env("HARPOCRATES_REGISTRATION_RECONCILE_DIR") or "",
-        stellar_network_passphrase=(
-            _str_env("STELLAR_NETWORK_PASSPHRASE")
-            or _str_env("HARPOCRATES_NETWORK_PASSPHRASE")
-            or ""
-        ),
+        upload_max_bytes=_optional_nonnegative_int_env("UPLOAD_MAX_BYTES"),
+        upload_temp_budget_bytes=_optional_nonnegative_int_env("UPLOAD_TEMP_BUDGET_BYTES"),
     )
 
 
