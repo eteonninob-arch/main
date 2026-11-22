@@ -614,6 +614,119 @@ def compare_verification_receipts(
     }
 
 
+TrustDependency = Literal["stellar_anchor", "rfc3161_anchor", "backdating_risk"]
+TrustOutcome = Literal["trusted", "invalid_signature", "unavailable", "not_present"]
+
+
+class TimestampChainDependency(TypedDict):
+    """One time-attestation dependency and its bounded trust result."""
+
+    dependency: TrustDependency
+    source: str
+    outcome: TrustOutcome
+    explanation: str
+
+
+class TimestampChainReport(TypedDict):
+    """Offline timestamp-chain validation report for one receipt."""
+
+    valid: bool
+    dependencies: list[TimestampChainDependency]
+    invalidSignatures: list[str]
+    unavailableTrust: list[str]
+    summary: str
+
+
+def build_timestamp_chain_report(
+    receipt: Mapping[str, object],
+) -> TimestampChainReport:
+    """Enumerate time-attestation dependencies with bounded, offline trust results.
+
+    Invalid signatures (a TSA or anchor that reports a failed verification) are
+    reported separately from unavailable trust material (a missing, unreachable
+    or unknown verification status). Nothing is fetched over the network.
+    """
+
+    ta = _optional_time_attestation(receipt, "candidate")
+    dependencies: list[TimestampChainDependency] = []
+    invalid: list[str] = []
+    unavailable: list[str] = []
+
+    if ta is None:
+        summary = "No time attestation present; no timestamp chain to validate."
+        return {
+            "valid": True,
+            "dependencies": [],
+            "invalidSignatures": [],
+            "unavailableTrust": [],
+            "summary": summary,
+        }
+
+    for anchor in ta.stellar_anchors:
+        source = f"stellar:{anchor.network_passphrase}@{anchor.ledger_sequence}"
+        dependencies.append(
+            {
+                "dependency": "stellar_anchor",
+                "source": source,
+                "outcome": "trusted",
+                "explanation": "Stellar ledger anchor is present for offline cross-check.",
+            }
+        )
+
+    for anchor in ta.rfc3161_anchors:
+        status = anchor.verification_status
+        source = f"rfc3161:{anchor.tsa_url}"
+        if status == "verified":
+            outcome: TrustOutcome = "trusted"
+            explanation = "RFC 3161 token signature verified against held trust material."
+        elif status in ("invalid", "failed", "bad_signature"):
+            outcome = "invalid_signature"
+            explanation = f"RFC 3161 token signature is invalid ({status})."
+            invalid.append(source)
+        else:
+            outcome = "unavailable"
+            explanation = (
+                f"RFC 3161 trust material unavailable or unknown ({status!r})."
+            )
+            unavailable.append(source)
+        dependencies.append(
+            {
+                "dependency": "rfc3161_anchor",
+                "source": source,
+                "outcome": outcome,
+                "explanation": explanation,
+            }
+        )
+
+    risk = check_backdating_risk(ta)["risk_level"]
+    dependencies.append(
+        {
+            "dependency": "backdating_risk",
+            "source": "time_attestation",
+            "outcome": "trusted" if risk == "low" else "unavailable",
+            "explanation": f"Backdating risk assessed as '{risk}' from local anchors.",
+        }
+    )
+    if risk != "low":
+        unavailable.append("time_attestation:backdating_risk")
+
+    valid = not invalid and not unavailable
+    if invalid:
+        summary = f"Invalid signatures detected in {len(invalid)} anchor(s)."
+    elif unavailable:
+        summary = f"Trust material unavailable for {len(unavailable)} dependency(ies)."
+    else:
+        summary = "All time-attestation dependencies validated offline."
+
+    return {
+        "valid": valid,
+        "dependencies": dependencies,
+        "invalidSignatures": invalid,
+        "unavailableTrust": unavailable,
+        "summary": summary,
+    }
+
+
 def format_receipt_comparison_report(report: ReceiptComparisonReport) -> str:
     """Render a deterministic human-readable receipt comparison report."""
 
