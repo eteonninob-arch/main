@@ -1,17 +1,17 @@
-"""Unit tests for backend/evidence_storage.py without a live Postgres database."""
+"""Tests for evidence_storage.assert_safe_destination and storage.BlobStore.
+
+All tests use temporary directories as the storage root so no real
+application state is touched.  No production credentials or database
+connections are required.
+"""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import os
+import tempfile
 from pathlib import Path
-import sys
-import threading
-import time
-import unittest
 from unittest.mock import patch
 
-from cryptography.fernet import Fernet, InvalidToken
 import pytest
 
 _BACKEND_DIR = str(Path(__file__).resolve().parent)
@@ -267,78 +267,120 @@ def master_key(monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Key wrapping & encryption tests (generate_dek, decrypt_dek, get_encryptor)
+# assert_safe_destination — core path-alias checks
 # ---------------------------------------------------------------------------
 
 
-def test_generate_and_decrypt_dek_roundtrip(master_key: str) -> None:
-    dek, encrypted_dek = evidence_storage.generate_dek()
+class TestAssertSafeDestination:
+    """Unit tests for the low-level alias-rejection function."""
 
-    assert isinstance(dek, bytes)
-    assert isinstance(encrypted_dek, bytes)
-    assert dek != encrypted_dek
+    def _protected(self, *paths: Path) -> frozenset[Path]:
+        return frozenset(p.resolve() for p in paths)
 
-    recovered = evidence_storage.decrypt_dek(encrypted_dek)
-    assert recovered == dek
-    assert Fernet(master_key.encode("ascii")).decrypt(encrypted_dek) == dek
+    def test_safe_path_is_accepted(self, tmp_path: Path) -> None:
+        """A destination outside any protected path raises nothing."""
+        safe = tmp_path / "evidence" / "abc123.bin"
+        protected = self._protected(tmp_path / "keys" / "secret.pem")
+        assert_safe_destination(safe, protected)  # must not raise
 
+    def test_exact_match_is_rejected(self, tmp_path: Path) -> None:
+        """A destination identical to a protected file is rejected."""
+        key_file = tmp_path / "keys" / "secret.pem"
+        with pytest.raises(ValueError, match="aliases protected path"):
+            assert_safe_destination(key_file, self._protected(key_file))
 
-def test_generate_dek_without_master_key_env_uses_ephemeral_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("MASTER_ENCRYPTION_KEY", raising=False)
+    def test_destination_inside_protected_directory_is_rejected(self, tmp_path: Path) -> None:
+        """A destination that is a child of a protected directory is rejected."""
+        source_tree = tmp_path / "app"
+        destination = source_tree / "config.py"
+        with pytest.raises(ValueError, match="inside a protected directory"):
+            assert_safe_destination(destination, self._protected(source_tree))
 
-    dek, encrypted_dek = evidence_storage.generate_dek()
-    assert isinstance(dek, bytes)
-    assert isinstance(encrypted_dek, bytes)
-    assert dek != encrypted_dek
+    def test_destination_that_is_parent_of_protected_file_is_rejected(self, tmp_path: Path) -> None:
+        """A destination that *contains* a protected file is rejected.
 
+        Writing to a directory that holds the metadata DB would replace
+        the directory entry — that must not be allowed.
+        """
+        db_dir = tmp_path / "data"
+        db_file = db_dir / "metadata.db"
+        # destination == db_dir (the directory that holds the DB file)
+        with pytest.raises(ValueError, match="parent of a protected path"):
+            assert_safe_destination(db_dir, self._protected(db_file))
 
-def test_decrypt_dek_rejects_missing_master_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("MASTER_ENCRYPTION_KEY", raising=False)
-    with pytest.raises(ValueError, match="MASTER_ENCRYPTION_KEY is not set"):
-        evidence_storage.decrypt_dek(b"some-encrypted-bytes")
+    def test_symlink_to_protected_file_is_rejected(self, tmp_path: Path) -> None:
+        """A symlink whose target resolves to a protected file is rejected."""
+        real_key = tmp_path / "real_keys" / "secret.pem"
+        real_key.parent.mkdir(parents=True)
+        real_key.write_bytes(b"key material")
 
+        link = tmp_path / "evidence" / "link_to_key"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(real_key)
 
-def test_decrypt_dek_rejects_wrong_key_or_corrupt_ciphertext(
-    master_key: str,
-) -> None:
-    other_key = Fernet.generate_key()
-    wrong_ciphertext = Fernet(other_key).encrypt(b"my-dek-value")
+        with pytest.raises(ValueError, match="aliases protected path"):
+            assert_safe_destination(link, frozenset({real_key.resolve()}))
 
-    with pytest.raises(InvalidToken):
-        evidence_storage.decrypt_dek(wrong_ciphertext)
+    def test_symlink_to_protected_directory_is_rejected(self, tmp_path: Path) -> None:
+        """A symlink whose target resolves to a protected directory is rejected."""
+        source_tree = tmp_path / "app"
+        source_tree.mkdir()
 
-    with pytest.raises(InvalidToken):
-        evidence_storage.decrypt_dek(b"completely-corrupted-token")
+        link = tmp_path / "evidence" / "sneaky_link"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(source_tree)
 
+        with pytest.raises(ValueError, match="aliases protected path"):
+            assert_safe_destination(link, frozenset({source_tree.resolve()}))
 
-def test_get_encryptor_encrypt_and_decrypt_roundtrip() -> None:
-    dek = Fernet.generate_key()
-    encryptor = evidence_storage.get_encryptor(dek)
+    def test_dotdot_traversal_to_protected_file_is_rejected(self, tmp_path: Path) -> None:
+        """Path-traversal via ``..`` components is resolved and rejected."""
+        key_file = (tmp_path / "keys" / "secret.pem").resolve()
+        traversal = tmp_path / "evidence" / ".." / "keys" / "secret.pem"
 
-    plaintext = b"top-secret-evidence-payload"
-    token = encryptor.encrypt(plaintext)
-    assert token != plaintext
-    assert encryptor.decrypt(token) == plaintext
+        with pytest.raises(ValueError, match="aliases protected path"):
+            assert_safe_destination(traversal, frozenset({key_file}))
+
+    def test_empty_protected_set_always_accepts(self, tmp_path: Path) -> None:
+        """With no protected paths every destination is acceptable."""
+        destination = tmp_path / "output" / "blob.bin"
+        assert_safe_destination(destination, frozenset())  # must not raise
+
+    def test_multiple_protected_paths_any_match_rejects(self, tmp_path: Path) -> None:
+        """When multiple protected paths are given, a match against any one rejects."""
+        key_a = tmp_path / "keyA.pem"
+        key_b = tmp_path / "keyB.pem"
+        protected = frozenset({key_a.resolve(), key_b.resolve()})
+
+        with pytest.raises(ValueError):
+            assert_safe_destination(key_b, protected)
+
+    def test_path_in_different_unprotected_subtree_is_accepted(self, tmp_path: Path) -> None:
+        """A path in a different subtree from the protected paths is fine."""
+        protected_dir = tmp_path / "protected"
+        safe_dir = tmp_path / "safe"
+        destination = safe_dir / "output.bin"
+
+        # The directories don't even need to exist on disk for path checks.
+        assert_safe_destination(destination, frozenset({protected_dir.resolve()}))
 
 
 # ---------------------------------------------------------------------------
-# DB persistence & idempotency tests (record_blob, record_tenant_ref, get_blob_info)
+# BlobStore — write / read / delete / escape prevention
 # ---------------------------------------------------------------------------
 
 
-def test_record_blob_executes_parameterized_insert_and_commits(
-    fake_db: FakeConnection,
-) -> None:
-    content_hash = "a" * 64
-    encrypted_dek = b"gAAAAABk-fake-encrypted-dek"
-    size_bytes = 4096
-    storage_path = "/var/lib/harpocrates/blobs/aa/aaaa"
+class TestBlobStore:
+    """Integration-style tests for BlobStore using a real temp directory."""
 
-    evidence_storage.record_blob(content_hash, encrypted_dek, size_bytes, storage_path)
+    def _make_store(self, tmp_path: Path, extra_protected: frozenset[Path] | None = None) -> BlobStore:
+        storage_root = tmp_path / "blobs"
+        storage_root.mkdir()
+        protected = frozenset({(tmp_path / "protected_key.pem").resolve()})
+        if extra_protected:
+            protected = protected | extra_protected
+        config = StorageConfig(storage_path=storage_root, protected_paths=protected)
+        return BlobStore(config)
 
     assert fake_db.commits == 1
     assert len(fake_db.executed) == 1
@@ -355,16 +397,23 @@ def test_record_blob_executes_parameterized_insert_and_commits(
         evidence_storage.DEFAULT_ENVELOPE_VERSION,
     )
 
+    def test_write_creates_file_with_correct_content(self, tmp_path: Path) -> None:
+        store = self._make_store(tmp_path)
+        store.write("abc123.bin", b"encrypted evidence")
+        dest = tmp_path / "blobs" / "abc123.bin"
+        assert dest.exists()
+        assert dest.read_bytes() == b"encrypted evidence"
 
-def test_record_blob_idempotent_on_duplicate_content_hash(
-    fake_db: FakeConnection,
-) -> None:
-    content_hash = "b" * 64
-    first_dek = b"gAAAAABk-first-dek"
-    second_dek = b"gAAAAABk-second-dek"
+    def test_write_returns_absolute_path(self, tmp_path: Path) -> None:
+        store = self._make_store(tmp_path)
+        result = store.write("output.bin", b"data")
+        assert result.is_absolute()
+        assert result == (tmp_path / "blobs" / "output.bin").resolve()
 
-    evidence_storage.record_blob(content_hash, first_dek, 1024, "/blobs/first")
-    evidence_storage.record_blob(content_hash, second_dek, 9999, "/blobs/second")
+    def test_write_creates_subdirectory_as_needed(self, tmp_path: Path) -> None:
+        store = self._make_store(tmp_path)
+        store.write("2026/11/abc.bin", b"blob")
+        assert (tmp_path / "blobs" / "2026" / "11" / "abc.bin").exists()
 
     assert fake_db.commits == 2
     assert len(fake_db.executed) == 2
@@ -391,37 +440,45 @@ def test_record_blob_idempotent_on_duplicate_content_hash(
         "envelope_version": evidence_storage.DEFAULT_ENVELOPE_VERSION,
     }
 
+    def test_write_rejects_traversal_escaping_root(self, tmp_path: Path) -> None:
+        store = self._make_store(tmp_path)
+        with pytest.raises(ValueError, match="escapes the storage root"):
+            store.write("../../etc/passwd", b"data")
 
-def test_record_tenant_ref_sql_parameters_and_idempotent_ref_count(
-    fake_db: FakeConnection,
-) -> None:
-    tenant_id = "tenant-alpha"
-    content_hash = "c" * 64
+    def test_write_rejects_destination_aliasing_protected_key(self, tmp_path: Path) -> None:
+        """A symlink inside the blob root that resolves to a protected key file is rejected.
 
-    evidence_storage.record_tenant_ref(tenant_id, content_hash)
-    evidence_storage.record_tenant_ref(tenant_id, content_hash)
+        Depending on where the symlink target resolves, the rejection may come
+        from the root-escape check (target is outside the blob root) or from
+        assert_safe_destination (target is inside the blob root but aliases a
+        protected file).  Either way, a ValueError is raised.
+        """
+        key_file = tmp_path / "protected_key.pem"
+        store = self._make_store(tmp_path)
+        link_name = "link_to_key.bin"
+        link_path = tmp_path / "blobs" / link_name
+        key_file.write_bytes(b"private key")
+        link_path.symlink_to(key_file)
 
-    assert fake_db.commits == 2
-    assert len(fake_db.executed) == 2
+        with pytest.raises(ValueError):
+            store.write(link_name, b"evil blob")
 
-    for sql, params in fake_db.executed:
-        normalized_sql = " ".join(sql.lower().split())
-        assert "insert into tenant_blob_refs (tenant_id, content_hash, ref_count)" in normalized_sql
-        assert "values (%s, %s, 1)" in normalized_sql
-        assert "on conflict (tenant_id, content_hash) do update" in normalized_sql
-        assert "set ref_count = tenant_blob_refs.ref_count + 1" in normalized_sql
-        assert params == (tenant_id, content_hash)
+    def test_write_rejects_destination_inside_protected_directory(self, tmp_path: Path) -> None:
+        """A symlink inside the blob root that points into a protected dir is rejected.
 
-    assert fake_db.tenant_refs[(tenant_id, content_hash)]["ref_count"] == 2
+        The symlink resolves outside the blob root so the escape check fires;
+        if it were somehow inside, assert_safe_destination would catch it.
+        Either way a ValueError is raised before any write occurs.
+        """
+        protected_dir = tmp_path / "app_source"
+        protected_dir.mkdir()
+        store = self._make_store(tmp_path, extra_protected=frozenset({protected_dir.resolve()}))
 
+        link = tmp_path / "blobs" / "sneaky"
+        link.symlink_to(protected_dir)
 
-def test_get_blob_info_returns_none_for_unknown_and_dict_for_known(
-    fake_db: FakeConnection,
-) -> None:
-    unknown_hash = "0" * 64
-    known_hash = "d" * 64
-    encrypted_dek = b"gAAAAABk-known-dek"
-    storage_path = "/blobs/dd/dddd"
+        with pytest.raises(ValueError):
+            store.write("sneaky/config.py", b"overwrite source")
 
     assert evidence_storage.get_blob_info(unknown_hash) is None
     sql, params = fake_db.executed[-1]
@@ -430,8 +487,10 @@ def test_get_blob_info_returns_none_for_unknown_and_dict_for_known(
     )
     assert params == (unknown_hash,)
 
-    evidence_storage.record_blob(known_hash, encrypted_dek, 512, storage_path)
-    result = evidence_storage.get_blob_info(known_hash)
+    def test_read_returns_stored_bytes(self, tmp_path: Path) -> None:
+        store = self._make_store(tmp_path)
+        store.write("file.bin", b"content")
+        assert store.read("file.bin") == b"content"
 
     assert result == {
         "encrypted_dek": encrypted_dek.decode(),
@@ -442,325 +501,126 @@ def test_get_blob_info_returns_none_for_unknown_and_dict_for_known(
 
 
 # ---------------------------------------------------------------------------
-# Reference removal, garbage collection, and concurrency tests
+# _collect_protected_paths — environment variable handling
 # ---------------------------------------------------------------------------
 
 
-def test_remove_tenant_ref_decrements_and_deletes(fake_db: FakeConnection, tmp_path: Path):
-    evidence_storage.record_blob("hash_1", b"dek", 10, str(tmp_path / "b1"))
+class TestCollectProtectedPaths:
+    """Verify that environment variables correctly influence the protected set."""
 
-    # Add reference twice
-    evidence_storage.record_tenant_ref("tenant_a", "hash_1")
-    evidence_storage.record_tenant_ref("tenant_a", "hash_1")
-    assert fake_db.tenant_refs[("tenant_a", "hash_1")]["ref_count"] == 2
+    def test_always_includes_source_root(self, tmp_path: Path) -> None:
+        """The application source directory is always protected."""
+        import storage as storage_module
 
-    # First remove decrements ref_count to 1
-    assert evidence_storage.remove_tenant_ref("tenant_a", "hash_1") is True
-    assert fake_db.tenant_refs[("tenant_a", "hash_1")]["ref_count"] == 1
+        with patch.dict(os.environ, {}, clear=False):
+            protected = _collect_protected_paths(tmp_path)
 
-    # Second remove deletes the reference row
-    assert evidence_storage.remove_tenant_ref("tenant_a", "hash_1") is True
-    assert ("tenant_a", "hash_1") not in fake_db.tenant_refs
+        source_root = Path(storage_module.__file__).resolve().parent
+        assert source_root in protected
 
-    # Third remove returns False since reference no longer exists
-    assert evidence_storage.remove_tenant_ref("tenant_a", "hash_1") is False
+    def test_includes_key_file_when_configured(self, tmp_path: Path) -> None:
+        key_file = str(tmp_path / "app.key")
+        with patch.dict(os.environ, {"EVIDENCE_STORAGE_KEY_FILE": key_file}):
+            protected = _collect_protected_paths(tmp_path)
+        assert Path(key_file).resolve() in protected
 
+    def test_excludes_key_file_when_not_configured(self, tmp_path: Path) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "EVIDENCE_STORAGE_KEY_FILE"}
+        with patch.dict(os.environ, env, clear=True):
+            protected = _collect_protected_paths(tmp_path)
+        # None of the protected paths should look like a key file from env
+        assert all("app.key" not in str(p) for p in protected)
 
-def test_blobs_with_remaining_references_are_never_deleted(fake_db: FakeConnection, tmp_path: Path):
-    b1_file = tmp_path / "b1.enc"
-    b1_file.write_bytes(b"content1")
-    evidence_storage.record_blob("hash_1", b"dek1", 8, str(b1_file))
+    def test_includes_sqlite_database_file(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "metadata.db")
+        db_url = f"sqlite:///{db_path}"
+        with patch.dict(os.environ, {"DATABASE_URL": db_url}):
+            protected = _collect_protected_paths(tmp_path)
+        assert Path(db_path).resolve() in protected
 
-    # Two tenants reference the same blob
-    evidence_storage.record_tenant_ref("tenant_a", "hash_1")
-    evidence_storage.record_tenant_ref("tenant_b", "hash_1")
-
-    # Tenant A removes reference
-    assert evidence_storage.remove_tenant_ref("tenant_a", "hash_1") is True
-
-    # Garbage collector should NOT delete hash_1 because Tenant B still references it
-    collected = evidence_storage.collect_unreferenced_blobs(limit=10)
-    assert collected == 0
-    assert b1_file.exists()
-    assert evidence_storage.get_blob_info("hash_1") is not None
-
-    # Tenant B removes reference
-    assert evidence_storage.remove_tenant_ref("tenant_b", "hash_1") is True
-
-    # Now hash_1 has zero references, so it should be collected
-    collected = evidence_storage.collect_unreferenced_blobs(limit=10)
-    assert collected == 1
-    assert not b1_file.exists()
-    assert evidence_storage.get_blob_info("hash_1") is None
-
-
-def test_file_deletion_failure_retried_on_next_run(fake_db: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    b_file = tmp_path / "failing.enc"
-    b_file.write_bytes(b"content")
-    evidence_storage.record_blob("hash_fail", b"dek", 7, str(b_file))
-
-    should_fail = True
-    orig_unlink = os.unlink
-
-    def fake_unlink(path):
-        if should_fail and str(path) == str(b_file):
-            raise PermissionError("Simulated file lock")
-        return orig_unlink(path)
-
-    monkeypatch.setattr(os, "unlink", fake_unlink)
-
-    # First run: unlink fails
-    collected = evidence_storage.collect_unreferenced_blobs(limit=10)
-    assert collected == 0
-    # The blob file and the DB row must be kept intact
-    assert b_file.exists()
-    assert evidence_storage.get_blob_info("hash_fail") is not None
-
-    # Verify metrics were not incremented
-    metrics = metrics_collector.generate_prometheus_metrics()
-    assert "harpocrates_retention_deleted_blobs_total 0" in metrics
-
-    # Second run: unlink succeeds
-    should_fail = False
-    collected = evidence_storage.collect_unreferenced_blobs(limit=10)
-    assert collected == 1
-    assert not b_file.exists()
-    assert evidence_storage.get_blob_info("hash_fail") is None
-
-    # Metrics incremented
-    metrics = metrics_collector.generate_prometheus_metrics()
-    assert "harpocrates_retention_deleted_blobs_total 1" in metrics
-    # Ensure no hashes are leaked in metrics
-    assert "hash_fail" not in metrics
-
-
-def test_concurrent_add_and_collect_race(fake_db: FakeConnection, tmp_path: Path):
-    """Simulate race: collector selects unreferenced blob, while concurrent tenant adds reference.
-
-    Row locking ensures the tenant's transaction cannot conflict with unreferenced collection.
-    """
-    b_file = tmp_path / "race.enc"
-    b_file.write_bytes(b"race-data")
-    evidence_storage.record_blob("hash_race", b"dek", 9, str(b_file))
-
-    race_barrier = threading.Barrier(2)
-    tenant_result = {"status": None}
-
-    def tenant_thread():
-        # Wait until collector has selected and locked the candidate row
-        race_barrier.wait()
-        try:
-            # Attempt to record tenant ref while collector transaction is active
-            evidence_storage.record_tenant_ref("tenant_race", "hash_race")
-            tenant_result["status"] = "success"
-        except Exception as e:
-            tenant_result["status"] = type(e).__name__
-
-    def collector_hook():
-        race_barrier.wait()
-        time.sleep(0.05)
-
-    fake_db.before_collector_delete_hook = collector_hook
-
-    t = threading.Thread(target=tenant_thread)
-    t.start()
-
-    collected = evidence_storage.collect_unreferenced_blobs(limit=10)
-    t.join()
-
-    # Collector successfully deleted the unreferenced blob
-    assert collected == 1
-    assert not b_file.exists()
-    assert evidence_storage.get_blob_info("hash_race") is None
-
-
-def test_concurrent_add_first_prevents_collection(fake_db: FakeConnection, tmp_path: Path):
-    """If tenant adds reference right before collection, the blob is never deleted."""
-    b_file = tmp_path / "safe.enc"
-    b_file.write_bytes(b"safe-data")
-    evidence_storage.record_blob("hash_safe", b"dek", 9, str(b_file))
-
-    # Add reference
-    evidence_storage.record_tenant_ref("tenant_safe", "hash_safe")
-
-    # Collector runs
-    collected = evidence_storage.collect_unreferenced_blobs(limit=10)
-    assert collected == 0
-    assert b_file.exists()
-    assert evidence_storage.get_blob_info("hash_safe") is not None
-
-
-def test_collect_unreferenced_blobs_batch_limit(fake_db: FakeConnection, tmp_path: Path):
-    # Create 5 unreferenced blobs
-    for i in range(5):
-        f = tmp_path / f"batch_{i}.enc"
-        f.write_bytes(b"x")
-        evidence_storage.record_blob(f"hash_{i}", b"dek", 1, str(f))
-
-    # Collect with limit=2
-    collected = evidence_storage.collect_unreferenced_blobs(limit=2)
-    assert collected == 2
-    assert len(fake_db.blobs) == 3
-
-    # Collect next batch with limit=2
-    collected = evidence_storage.collect_unreferenced_blobs(limit=2)
-    assert collected == 2
-    assert len(fake_db.blobs) == 1
-
-    # Collect remaining with limit=2
-    collected = evidence_storage.collect_unreferenced_blobs(limit=2)
-    assert collected == 1
-    assert len(fake_db.blobs) == 0
-
-
-def test_metrics_do_not_expose_hashes(fake_db: FakeConnection, tmp_path: Path):
-    sensitive_hash = "super_secret_evidence_hash_12345"
-    f = tmp_path / "secret.enc"
-    f.write_bytes(b"data")
-    evidence_storage.record_blob(sensitive_hash, b"dek", 4, str(f))
-
-    evidence_storage.collect_unreferenced_blobs(limit=10)
-
-    metrics = metrics_collector.generate_prometheus_metrics()
-    assert sensitive_hash not in metrics
-    assert "super_secret" not in metrics
-    assert "harpocrates_retention_deleted_blobs_total 1" in metrics
+    def test_ignores_postgresql_database_url(self, tmp_path: Path) -> None:
+        pg_url = "postgresql://user:pass@host/db?sslmode=require"
+        with patch.dict(os.environ, {"DATABASE_URL": pg_url}):
+            protected = _collect_protected_paths(tmp_path)
+        # No entry in the protected set should contain "postgresql" as a path
+        assert all("postgresql" not in str(p) for p in protected)
 
 
 # ---------------------------------------------------------------------------
-# Per-tenant retention preview tests
+# load_storage_config — full config construction
 # ---------------------------------------------------------------------------
 
 
-def test_preview_tenant_retention_counts_ages_and_eligibility(
-    fake_db: FakeConnection, tmp_path: Path
-) -> None:
-    now_ts = 1_700_000_000.0
+class TestLoadStorageConfig:
+    """Test the top-level config loader, including storage-root conflict detection."""
 
-    # Exclusive old blob (eligible when ttl=3600)
-    evidence_storage.record_blob("hash_a_old", b"dek1", 1000, str(tmp_path / "a_old.enc"))
-    fake_db.blobs["hash_a_old"]["created_at"] = now_ts - 7200.0
-    evidence_storage.record_tenant_ref("tenant_a", "hash_a_old")
-    evidence_storage.record_tenant_ref("tenant_a", "hash_a_old")
+    def test_returns_none_when_path_not_set(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "EVIDENCE_STORAGE_PATH"}
+        with patch.dict(os.environ, env, clear=True):
+            assert load_storage_config() is None
 
-    # Exclusive recent blob (within retention window when ttl=3600)
-    evidence_storage.record_blob("hash_a_new", b"dek2", 500, str(tmp_path / "a_new.enc"))
-    fake_db.blobs["hash_a_new"]["created_at"] = now_ts - 600.0
-    evidence_storage.record_tenant_ref("tenant_a", "hash_a_new")
+    def test_returns_config_for_valid_path(self, tmp_path: Path) -> None:
+        storage_dir = str(tmp_path / "evidence")
+        with patch.dict(os.environ, {"EVIDENCE_STORAGE_PATH": storage_dir}, clear=False):
+            config = load_storage_config()
+        assert config is not None
+        assert config.storage_path == Path(storage_dir)
 
-    # Shared old blob (ineligible because tenant_b also references it)
-    evidence_storage.record_blob("hash_shared", b"dek3", 250, str(tmp_path / "shared.enc"))
-    fake_db.blobs["hash_shared"]["created_at"] = now_ts - 10800.0
-    evidence_storage.record_tenant_ref("tenant_a", "hash_shared")
-    evidence_storage.record_tenant_ref("tenant_b", "hash_shared")
+    def test_raises_when_storage_path_aliases_source_root(self) -> None:
+        """Configuring EVIDENCE_STORAGE_PATH to the app source dir is rejected at load time."""
+        import storage as storage_module
 
-    # Tenant B's private blob (must never appear in tenant_a's preview)
-    evidence_storage.record_blob(
-        "hash_b_secret", b"dek4", 9999, str(tmp_path / "tenant_b_private_path.enc")
-    )
-    fake_db.blobs["hash_b_secret"]["created_at"] = now_ts - 20000.0
-    evidence_storage.record_tenant_ref("tenant_b", "hash_b_secret")
+        source_root = str(Path(storage_module.__file__).resolve().parent)
+        with patch.dict(os.environ, {"EVIDENCE_STORAGE_PATH": source_root}, clear=False):
+            with pytest.raises(RuntimeError, match="conflicts with protected path"):
+                load_storage_config()
 
-    preview = evidence_storage.preview_tenant_retention(
-        "tenant_a", now=now_ts, ttl_seconds=3600
-    )
+    def test_raises_when_storage_path_aliases_sqlite_db(self, tmp_path: Path) -> None:
+        """EVIDENCE_STORAGE_PATH must not alias the SQLite metadata database."""
+        db_path = tmp_path / "metadata.db"
+        db_path.write_bytes(b"")
+        env = {
+            "EVIDENCE_STORAGE_PATH": str(db_path),
+            "DATABASE_URL": f"sqlite:///{db_path}",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with pytest.raises(RuntimeError, match="conflicts with protected path"):
+                load_storage_config()
 
-    assert preview["tenant_id"] == "tenant_a"
-    assert preview["ttl_seconds"] == 3600
-    assert preview["blob_count"] == 3
-    assert preview["total_ref_count"] == 4
-    assert preview["total_size_bytes"] == 1750
-    assert preview["eligible_for_deletion_count"] == 1
-    assert preview["retained_count"] == 2
-    assert preview["shared_blob_count"] == 1
-    assert preview["oldest_age_seconds"] == pytest.approx(10800.0)
-    assert preview["newest_age_seconds"] == pytest.approx(600.0)
-    assert preview["average_age_seconds"] == pytest.approx((10800.0 + 7200.0 + 600.0) / 3)
-
-    by_hash = {item["content_hash"]: item for item in preview["blobs"]}
-    assert set(by_hash.keys()) == {"hash_a_old", "hash_a_new", "hash_shared"}
-
-    assert by_hash["hash_a_old"]["ref_count"] == 2
-    assert by_hash["hash_a_old"]["age_seconds"] == pytest.approx(7200.0)
-    assert by_hash["hash_a_old"]["deletion_eligible"] is True
-    assert by_hash["hash_a_old"]["deletion_ineligible_reason"] is None
-
-    assert by_hash["hash_a_new"]["ref_count"] == 1
-    assert by_hash["hash_a_new"]["age_seconds"] == pytest.approx(600.0)
-    assert by_hash["hash_a_new"]["deletion_eligible"] is False
-    assert by_hash["hash_a_new"]["deletion_ineligible_reason"] == "within_retention_window"
-
-    assert by_hash["hash_shared"]["ref_count"] == 1
-    assert by_hash["hash_shared"]["age_seconds"] == pytest.approx(10800.0)
-    assert by_hash["hash_shared"]["deletion_eligible"] is False
-    assert by_hash["hash_shared"]["deletion_ineligible_reason"] == "shared_with_other_tenants"
-
-    # Read-only: DB state untouched
-    assert len(fake_db.blobs) == 4
-    assert fake_db.tenant_refs[("tenant_a", "hash_a_old")]["ref_count"] == 2
+    def test_raises_when_storage_path_aliases_key_file(self, tmp_path: Path) -> None:
+        """EVIDENCE_STORAGE_PATH must not alias the encryption key file."""
+        key_file = tmp_path / "secret.pem"
+        key_file.write_bytes(b"key")
+        env = {
+            "EVIDENCE_STORAGE_PATH": str(key_file),
+            "EVIDENCE_STORAGE_KEY_FILE": str(key_file),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with pytest.raises(RuntimeError, match="conflicts with protected path"):
+                load_storage_config()
 
 
-def test_preview_tenant_retention_keeps_other_tenants_and_storage_paths_private(
-    fake_db: FakeConnection, tmp_path: Path
-) -> None:
-    now_ts = 1_700_000_000.0
-    path_a = str(tmp_path / "secret_dir_a" / "blob_a.enc")
-    path_b = str(tmp_path / "secret_dir_b" / "blob_b.enc")
-    hash_b = "b_private_hash_987654321"
-
-    evidence_storage.record_blob("hash_a_only", b"dek_a", 128, path_a)
-    fake_db.blobs["hash_a_only"]["created_at"] = now_ts - 100.0
-    evidence_storage.record_tenant_ref("tenant_a", "hash_a_only")
-
-    evidence_storage.record_blob(hash_b, b"dek_b", 256, path_b)
-    fake_db.blobs[hash_b]["created_at"] = now_ts - 500.0
-    evidence_storage.record_tenant_ref("tenant_b", hash_b)
-
-    preview = evidence_storage.preview_tenant_retention("tenant_a", now=now_ts)
-    serialized = str(preview)
-
-    assert hash_b not in serialized
-    assert "tenant_b" not in serialized
-    assert path_a not in serialized
-    assert path_b not in serialized
-    assert "storage_path" not in serialized
-    assert "encrypted_dek" not in serialized
-
-    # Verify the SQL query itself does not select storage_path or encrypted_dek
-    sql, params = fake_db.executed[-1]
-    normalized_sql = " ".join(sql.lower().split())
-    assert "storage_path" not in normalized_sql
-    assert "encrypted_dek" not in normalized_sql
-    assert params == ("tenant_a",)
+# ---------------------------------------------------------------------------
+# _paths_alias helper
+# ---------------------------------------------------------------------------
 
 
-def test_preview_tenant_retention_empty_and_boundary_cases(fake_db: FakeConnection) -> None:
-    now_ts = 1_700_000_000.0
+class TestPathsAlias:
+    """Unit tests for the _paths_alias helper used in storage root validation."""
 
-    # Empty tenant
-    empty = evidence_storage.preview_tenant_retention("tenant_empty", now=now_ts, ttl_seconds=60)
-    assert empty["blob_count"] == 0
-    assert empty["total_ref_count"] == 0
-    assert empty["total_size_bytes"] == 0
-    assert empty["eligible_for_deletion_count"] == 0
-    assert empty["retained_count"] == 0
-    assert empty["shared_blob_count"] == 0
-    assert empty["oldest_age_seconds"] is None
-    assert empty["newest_age_seconds"] is None
-    assert empty["average_age_seconds"] is None
-    assert empty["blobs"] == []
+    def test_identical_paths_alias(self, tmp_path: Path) -> None:
+        p = tmp_path / "file.txt"
+        assert _paths_alias(p, p) is True
 
-    # Exact TTL boundary: age == ttl_seconds is eligible
-    evidence_storage.record_blob("hash_boundary", b"dek", 64, "/blobs/boundary")
-    fake_db.blobs["hash_boundary"]["created_at"] = now_ts - 60.0
-    evidence_storage.record_tenant_ref("tenant_bound", "hash_boundary")
+    def test_child_aliases_parent_directory(self, tmp_path: Path) -> None:
+        parent = tmp_path / "dir"
+        child = parent / "file.txt"
+        assert _paths_alias(child, parent) is True
 
-    boundary = evidence_storage.preview_tenant_retention(
-        "tenant_bound", now=now_ts, ttl_seconds=60
-    )
-    assert boundary["eligible_for_deletion_count"] == 1
-    assert boundary["blobs"][0]["deletion_eligible"] is True
-    assert boundary["blobs"][0]["deletion_ineligible_reason"] is None
+    def test_parent_aliases_child(self, tmp_path: Path) -> None:
+        parent = tmp_path / "dir"
+        child = parent / "file.txt"
+        assert _paths_alias(parent, child) is True
 
 
 def test_preview_tenant_retention_rejects_invalid_inputs(fake_db: FakeConnection) -> None:

@@ -31,7 +31,8 @@ import {
   serializeC2paExport,
   type C2paExport,
 } from './c2pa.js'
-import { verifyLineageTree, formatLineageTree, type LineageTreeResult } from './verify-lineage.js'
+import { verifyLineageTree, formatLineageTree } from './verify-lineage.js'
+import { parseOfflineBundle, verifyOfflineBundle, formatOfflineBundleReport } from './verify-bundle.js'
 import { logStructured, redactSensitive } from './logging.js'
 import { createRequire } from 'node:module'
 import { parseCliArgs, CliUsageError, type ParsedArgs } from './args.js'
@@ -53,14 +54,24 @@ function getCliVersion(): string {
 
 // ── I/O helpers ───────────────────────────────────────────────────────────
 
-async function readText(path: string): Promise<string> {
+export async function readText(
+  source: string | NodeJS.ReadableStream,
+  limit: number = MAX_MANIFEST_BYTES,
+): Promise<string> {
   const chunks: Buffer[] = []
   let size = 0
-  const source = path === '-' ? process.stdin : createReadStream(path)
-  for await (const chunk of source) {
+  const stream: NodeJS.ReadableStream =
+    typeof source !== 'string'
+      ? source
+      : source === '-'
+        ? process.stdin
+        : createReadStream(source)
+  for await (const chunk of stream) {
     size += Buffer.byteLength(chunk)
-    if (size > 1024 * 1024) {
-      if (path !== '-') source.destroy()
+    if (size > limit) {
+      if (typeof (stream as unknown as { destroy?: () => void }).destroy === 'function') {
+        (stream as unknown as { destroy: () => void }).destroy()
+      }
       throw new Error('input exceeds 1 MiB limit')
     }
     chunks.push(Buffer.from(chunk))
@@ -185,6 +196,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       return await handleC2pa(flags, debugLog)
     case 'verify-lineage':
       return await handleVerifyLineage(flags, debugLog)
+    case 'verify-bundle':
+      return await handleVerifyBundle(flags, debugLog)
     case 'register':
       return await handleRegister(flags, debugLog)
     case 'help':
@@ -588,6 +601,33 @@ export const STATUS_EXIT_CODES: Record<ProofLifecycleStatus, number> = {
   unknown: 3,
 }
 
+async function handleVerifyBundle(
+  flags: Record<string, string>,
+  debugLog: (event: Record<string, unknown>) => void,
+): Promise<void> {
+  const bundlePath = flags.bundle || flags.b
+  if (!bundlePath) exit(2, '--bundle is required')
+
+  let bundle: ReturnType<typeof parseOfflineBundle>
+  try {
+    const raw = await readText(bundlePath)
+    bundle = parseOfflineBundle(raw)
+  } catch (err) {
+    exit(8, err instanceof Error ? err.message : 'invalid or unreadable bundle')
+  }
+
+  debugLog({ event: 'verify-bundle.input', bundle: redactSensitive(bundle) })
+
+  const report = await verifyOfflineBundle(bundle)
+
+  if (flags.output === 'json' || flags.o === 'json') {
+    printJson(report)
+  } else {
+    printText(formatOfflineBundleReport(report))
+  }
+  exit(report.summary.allValid ? 0 : 8)
+}
+
 export function formatProofStatus(info: {
   proofId: string
   contractId: string
@@ -683,6 +723,8 @@ Commands:
   manifest       Create a proof manifest from metadata.
   hash           Compute the SHA-256 hash of a file.
   verify-receipt Verify an offline signed receipt.
+  verify-bundle  Verify receipts, manifests and a trust snapshot from a local
+                 bundle offline; online-only checks are reported as unavailable.
   c2pa           Export C2PA authenticity assertions from a proof manifest.
   version        Print the CLI version.
   help           Show this help message.
@@ -758,6 +800,14 @@ Manifest options:
 Hash options:
   --file, -f        Path to the file to hash (use "-" for stdin; required).
   --output, -o      Output format: "text" (default) or "json".
+
+Verify-bundle options:
+  --bundle, -b      Path to a local offline-verification bundle JSON (use "-"
+                    for stdin; required). The bundle holds a trust snapshot
+                    (verifier keys + network), manifests and signed receipts.
+  --output, -o      Output format: "text" (default) or "json".
+  Validates manifests and receipts offline; on-chain checks (proof status,
+  transaction confirmation, lineage) are reported as unavailable.
 
 Environment variables:
   HARPOCRATES_SOURCE_ADDRESS   Source address for Stellar simulation.
